@@ -1,0 +1,14 @@
+# Configuration files with sensitive data
+config.yaml
+
+# Output folder containing trade logs
+output/
+
+# Python virtual environment folder
+trade_bot/
+__pycache__/
+*.pyc
+
+# IDE-specific folders
+.idea/
+.vscode/

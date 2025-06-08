@@ -1,0 +1,9 @@
+pandas
+numpy
+pyyaml
+kiteconnect
+talib-binary
+openpyxl
+kiteconnect
+
+
