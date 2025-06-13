@@ -1,13 +1,17 @@
 # Configuration files with sensitive data
 config.yaml
 
-# Output folder containing trade logs
+# Output folder containing trade logs and other artifacts
 output/
+
+# Cache folder for downloaded news articles
+news_cache/
 
 # Python virtual environment folder
 trade_bot/
 __pycache__/
 *.pyc
+*.py[co]
 
 # IDE-specific folders
 .idea/
