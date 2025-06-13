@@ -2,31 +2,53 @@ import logging
 import yaml
 import time
 import datetime
+import calendar
 import pandas as pd
+import asyncio # <-- IMPORT ASYNCIO
 from kiteconnect import KiteConnect
-from agents import SignalAgent, OrderExecutionAgent, PositionManagementAgent
-from reporting import initialize_trade_log, log_trade, send_email_report
+from agents import OrderExecutionAgent, PositionManagementAgent
+from sentiment_agent import SentimentAgent
+from langgraph_agent import LangGraphAgent
+from strategy_factory import get_strategy
+from backtester import run_backtest
+from reporting import send_daily_report, send_monthly_report, initialize_trade_log, log_trade
 from indicators import calculate_cpr
+from market_context import MarketConditionIdentifier
+import multiprocessing
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def load_config():
-    with open('config.yaml', 'r') as file: return yaml.safe_load(file)
+    """Loads the configuration from config.yaml."""
+    with open('config.yaml', 'r') as file:
+        return yaml.safe_load(file)
+
 def save_config(config):
-    with open('config.yaml', 'w') as file: yaml.dump(config, file)
+    """Saves the configuration to config.yaml."""
+    with open('config.yaml', 'w') as file:
+        yaml.dump(config, file)
 
 class TradingBotOrchestrator:
+    """
+    The main orchestrator for the AI trading bot. It manages the setup,
+    strategy selection, and trading loop by directing the various agents.
+    """
     def __init__(self, config):
         self.config = config
-        self.kite = KiteConnect(api_key=config['zerodha']['api_key'])
+        self.kite = KiteConnect(api_key=config['zerodha']['api_key'], timeout=120)
+        self.active_strategy = None
+        self.active_strategy_name = "None" # To hold the name of the winning strategy
+        self.langgraph_agent = LangGraphAgent(config)
+        self.sentiment_agent = SentimentAgent(config)
+        self.market_condition_identifier = MarketConditionIdentifier(self.kite, config)
+        self.order_agent = OrderExecutionAgent(self.kite, config)
+        self.position_agent = None
         self.day_sentiment = ""
         self.trades_today_count = 0
         self.cpr_pivots = {}
-        # Agents
-        self.signal_agent = None
-        self.order_agent = None
-        self.position_agent = None
+        self.no_trade_reason = None
+        self.starting_capital = 0 # To track daily P/L %
 
     def authenticate(self):
         """Handles the Zerodha authentication flow."""
@@ -36,9 +58,12 @@ class TradingBotOrchestrator:
                 self.kite.set_access_token(access_token)
                 profile = self.kite.profile()
                 logging.info(f"Authenticated as {profile.get('user_name', 'user')}.")
+                # Capture starting capital right after successful authentication
+                self.starting_capital = self.kite.margins()['equity']['available']['live_balance']
+                logging.info(f"Today's starting capital: {self.starting_capital:,.2f}")
                 return True
             except Exception:
-                logging.warning("Access token expired. Starting new login.")
+                logging.warning("Access token expired. Re-authenticating.")
         
         logging.info(f"Login URL: {self.kite.login_url()}")
         request_token = input("Enter request_token: ")
@@ -48,79 +73,115 @@ class TradingBotOrchestrator:
             self.config['zerodha']['access_token'] = data['access_token']
             save_config(self.config)
             logging.info("Authentication successful.")
+            # Capture starting capital after new authentication
+            self.starting_capital = self.kite.margins()['equity']['available']['live_balance']
+            logging.info(f"Today's starting capital: {self.starting_capital:,.2f}")
             return True
         except Exception as e:
-            logging.error(f"Authentication failed: {e}")
+            logging.error(f"Auth failed: {e}")
             return False
 
-    def setup(self):
-        """Initial setup before market opens."""
-        self.day_sentiment = input("Enter day's sentiment (Bullish/Bearish): ").strip().capitalize()
-        if self.day_sentiment not in ["Bullish", "Bearish"]: return False
+    async def setup(self): # <-- MADE ASYNC
+        """Runs the entire pre-market setup and strategy selection process."""
+        logging.info("--- Starting Bot Setup Sequence ---")
+        today = datetime.date.today()
         
+        todays_conditions = self.market_condition_identifier.get_conditions_for_date(today)
+        if 'UNKNOWN' in todays_conditions:
+            self.no_trade_reason = "Could not determine today's market conditions."
+            return False
+        
+        self.day_sentiment = self.sentiment_agent.get_market_sentiment()
+        if self.day_sentiment not in ["Bullish", "Bearish"]:
+            self.no_trade_reason = f"Market sentiment is neutral or invalid ('{self.day_sentiment}')."
+            return False
+        logging.info(f"Day's Sentiment set to: {self.day_sentiment}")
+        
+        # --- FIX APPLIED HERE: Must 'await' the async function ---
+        ai_strategy_name = await self.langgraph_agent.get_recommended_strategy(todays_conditions)
+        # --- END OF FIX ---
+
+        if self.config['trading_flags']['run_startup_backtest']:
+            to_date = today
+            from_date = to_date - datetime.timedelta(days=365 * self.config['trading_flags']['backtest_years'])
+            default_strategy = "Gemini_Default"
+            tasks = [(self.kite, self.config, name, from_date, to_date, (todays_conditions if name == ai_strategy_name else None)) for name in list(set([default_strategy, ai_strategy_name]))]
+            results = {}
+            if self.config['trading_flags']['enable_parallel_processing']:
+                with multiprocessing.Pool(processes=len(tasks)) as pool:
+                    win_rates = pool.starmap(run_backtest, tasks)
+                    for i, task in enumerate(tasks): results[task[2]] = win_rates[i]
+            else:
+                for task in tasks: results[task[2]] = run_backtest(*task)
+            
+            if not results: 
+                self.no_trade_reason = "Backtesting yielded no results."
+                return False
+            self.active_strategy_name = max(results, key=results.get)
+            best_win_rate = results[self.active_strategy_name]
+            
+            logging.info(f"Selected Strategy: '{self.active_strategy_name}' with win rate {best_win_rate:.2f}%")
+
+            if best_win_rate < self.config['trading_flags']['win_rate_threshold']:
+                self.no_trade_reason = f"Winning strategy '{self.active_strategy_name}' win rate ({best_win_rate:.2f}%) is below threshold."
+                return False
+        else:
+            logging.warning("Startup backtest validation is DISABLED.")
+            self.active_strategy_name = ai_strategy_name
+            logging.info(f"Directly selecting AI Recommended Strategy: '{self.active_strategy_name}'")
+
+        self.active_strategy = get_strategy(self.active_strategy_name, self.kite, self.config)
         initialize_trade_log()
-        
-        # Calculate CPR
         token = [i['instrument_token'] for i in self.kite.instruments('NSE') if i['tradingsymbol'] == self.config['trading_flags']['underlying_instrument']][0]
-        to_date = datetime.date.today(); from_date = to_date - datetime.timedelta(days=7)
-        hist = self.kite.historical_data(token, from_date, to_date, "day")
+        hist = self.kite.historical_data(token, today - datetime.timedelta(days=7), today, "day")
         self.cpr_pivots = calculate_cpr(pd.DataFrame(hist).iloc[-2:-1])
-        if not self.cpr_pivots:
-            logging.error("Could not calculate CPR. Exiting.")
-            return False
-        logging.info(f"CPR Calculated: TC={self.cpr_pivots['tc']:.2f}, P={self.cpr_pivots['pivot']:.2f}, BC={self.cpr_pivots['bc']:.2f}")
-
-        # Initialize Agents
-        self.signal_agent = SignalAgent(self.kite, self.config)
-        self.order_agent = OrderExecutionAgent(self.kite, self.config)
         self.position_agent = PositionManagementAgent(self.kite, self.config, self.cpr_pivots)
         return True
 
-    def run(self):
-        """The main trading loop, orchestrating agents."""
-        if not self.authenticate() or not self.setup():
+    async def run(self): # <-- MADE ASYNC
+        """The main trading loop, orchestrating all agent actions."""
+        if not self.authenticate() or not await self.setup(): # <-- AWAIT SETUP
+            logging.warning("Setup failed or trading conditions not met. Bot will exit after sending EOD report.")
+            send_daily_report(self.config, str(datetime.date.today()), no_trades_reason=self.no_trade_reason)
             return
             
-        logging.info("Bot is running...")
+        is_paper_trading = self.config['trading_flags']['paper_trading']
+        logging.info(f"Bot is running in {'PAPER TRADING' if is_paper_trading else 'LIVE TRADING'} mode with strategy '{self.active_strategy_name}'.")
         
         while datetime.datetime.now().time() < datetime.time(15, 30):
             try:
-                # --- Position Management ---
-                if self.position_agent.active_trade:
-                    status = self.position_agent.manage()
-                    if status and status != 'ACTIVE': # A trade was closed
-                        log_trade(status) # status is the completed trade dict
-                    time.sleep(10) # Check active position more frequently
-                    continue
+                if datetime.datetime.now().time() < datetime.time(9, 45):
+                    await asyncio.sleep(60); continue # <-- USE ASYNCIO.SLEEP
 
-                # --- Signal Generation & New Trades ---
-                if self.trades_today_count >= self.config['trading_flags']['max_trades_per_day']:
-                    logging.info("Max trades reached. Only managing open positions.")
-                    time.sleep(300); continue
-
-                to_d = datetime.datetime.now(); from_d = to_d - datetime.timedelta(days=5)
-                hist_df = pd.DataFrame(self.kite.historical_data(self.signal_agent.underlying_token, from_d, to_d, self.config['trading_flags']['chart_timeframe']))
-                if hist_df.empty: time.sleep(60); continue
-
-                signal = self.signal_agent.check_for_signals(hist_df, self.cpr_pivots, self.day_sentiment)
-
-                if signal != 'HOLD':
-                    logging.info(f"Signal Agent returned: {signal}. Handing over to Order Agent.")
-                    trade_details = self.order_agent.place_trade(signal)
-                    if trade_details:
-                        self.trades_today_count += 1
-                        self.position_agent.start_trade(trade_details)
+                if not self.position_agent.active_trade and self.trades_today_count < self.config['trading_flags']['max_trades_per_day']:
+                    token = [i['instrument_token'] for i in self.kite.instruments('NSE') if i['tradingsymbol'] == self.config['trading_flags']['underlying_instrument']][0]
+                    hist_df = pd.DataFrame(self.kite.historical_data(token, datetime.datetime.now() - datetime.timedelta(days=5), datetime.datetime.now(), self.config['trading_flags']['chart_timeframe']))
+                    
+                    if not hist_df.empty:
+                        signal = self.active_strategy.generate_signals(hist_df, self.day_sentiment, cpr_pivots=self.cpr_pivots)
+                        if signal != 'HOLD':
+                            trade_details = self.order_agent.get_paper_trade_details(signal) if is_paper_trading else self.order_agent.place_trade(signal)
+                            if trade_details:
+                                trade_details['Strategy'] = self.active_strategy_name
+                                self.position_agent.start_trade(trade_details); self.trades_today_count += 1
+                elif self.position_agent.active_trade:
+                    status = self.position_agent.manage(is_paper_trading)
+                    if status and status != 'ACTIVE': log_trade(status)
                 
-                # Wait for the next candle
-                time.sleep(int(self.config['trading_flags']['chart_timeframe'].replace('minute','')) * 60 - 10)
-
+                await asyncio.sleep(30) # <-- USE ASYNCIO.SLEEP
             except Exception as e:
-                logging.error(f"Error in main loop: {e}", exc_info=True)
-                time.sleep(60)
+                logging.error(f"Error in main loop: {e}", exc_info=True); await asyncio.sleep(60)
         
+        today = datetime.date.today()
         logging.info("Market closed. Sending daily report.")
-        send_email_report(self.config, str(datetime.date.today()))
-
+        send_daily_report(self.config, str(today))
+        
+        _, last_day_of_month = calendar.monthrange(today.year, today.month)
+        if today.day == last_day_of_month:
+            logging.info("Last day of the month. Sending monthly summary report.")
+            send_monthly_report(self.config, str(today))
+        
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     bot = TradingBotOrchestrator(load_config())
-    bot.run()
+    asyncio.run(bot.run()) # <-- USE ASYNCIO.RUN TO START THE BOT

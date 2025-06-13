@@ -4,6 +4,10 @@ pyyaml
 kiteconnect
 talib-binary
 openpyxl
-kiteconnect
-
+newsapi-python
+textblob
+pandas-ta
+aiohttp
+requests
+beautifulsoup4
 

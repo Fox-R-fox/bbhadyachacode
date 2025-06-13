@@ -1,86 +1,135 @@
 import pandas as pd
 import datetime
 import logging
-import yaml
-from kiteconnect import KiteConnect
-from indicators import *
+from strategy_factory import get_strategy
+from market_context import MarketConditionIdentifier
+import time
+import pandas_ta as ta
 
-# --- Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+def fetch_historical_data_in_chunks(kite, token, from_date, to_date, timeframe):
+    """
+    Fetches historical data by breaking the request into smaller chunks
+    to comply with the API's date range limits for intraday data.
+    """
+    all_data = []
+    current_from = from_date
+    
+    while current_from <= to_date:
+        current_to = current_from + datetime.timedelta(days=99)
+        if current_to > to_date:
+            current_to = to_date
+            
+        logging.info(f"Fetching data from {current_from} to {current_to}")
+        try:
+            chunk = kite.historical_data(token, current_from, current_to, timeframe)
+            all_data.extend(chunk)
+            time.sleep(0.5) 
+        except Exception as e:
+            logging.error(f"Error fetching data chunk from {current_from} to {current_to}: {e}")
+        
+        current_from = current_to + datetime.timedelta(days=1)
+        
+    return pd.DataFrame(all_data)
 
-def load_config():
-    with open('config.yaml', 'r') as file: return yaml.safe_load(file)
+def run_backtest(kite, config, strategy_name, from_date, to_date, target_conditions=None):
+    """
+    Runs a backtest for a given strategy. If target_conditions are provided,
+    it runs a conditional backtest only on days matching those conditions.
+    """
+    mode = "Conditional" if target_conditions else "Full"
+    logging.info(f"--- Starting {mode} Backtest for Strategy: {strategy_name} ---")
+    if mode == "Conditional": logging.info(f"--- Target Conditions: {target_conditions} ---")
 
-def run_backtest(kite, config, from_date, to_date):
     underlying_name = config['trading_flags']['underlying_instrument']
-    signals_config = config['strategy_signals']
     timeframe = config['trading_flags']['chart_timeframe']
     
-    token = [i['instrument_token'] for i in kite.instruments('NSE') if i['tradingsymbol'] == underlying_name][0]
+    try:
+        nifty_token = [i['instrument_token'] for i in kite.instruments('NSE') if i['tradingsymbol'] == underlying_name][0]
+        vix_token = [i['instrument_token'] for i in kite.instruments('NSE') if i['tradingsymbol'] == 'INDIA VIX'][0]
+    except (IndexError, KeyError) as e:
+        logging.error(f"Could not find instrument token: {e}"); return 0.0
 
-    all_data_day = kite.historical_data(token, from_date, to_date, "day", continuous=True)
-    all_data_tf = kite.historical_data(token, from_date, to_date, timeframe, continuous=True)
+    all_data_day = fetch_historical_data_in_chunks(kite, nifty_token, from_date, to_date, "day")
+    all_data_tf = fetch_historical_data_in_chunks(kite, nifty_token, from_date, to_date, timeframe)
+    vix_data = fetch_historical_data_in_chunks(kite, vix_token, from_date, to_date, "day")
     
-    daily_df = pd.DataFrame(all_data_day)
-    daily_df['date'] = pd.to_datetime(daily_df['date']).dt.date
-    df_tf = pd.DataFrame(all_data_tf)
-    df_tf['date_only'] = pd.to_datetime(df_tf['date']).dt.date
+    if all_data_day.empty or all_data_tf.empty:
+        logging.error("Failed to fetch sufficient historical data for backtest."); return 0.0
 
+    all_data_day['date'] = pd.to_datetime(all_data_day['date']).dt.date
+    vix_data['date'] = pd.to_datetime(vix_data['date']).dt.date
+    all_data_day['daily_volatility'] = all_data_day['close'].pct_change().rolling(window=7).std()
+    all_data_tf['date_only'] = pd.to_datetime(all_data_tf['date']).dt.date
+
+    strategy = get_strategy(strategy_name, kite, config)
     trades = []
-    logging.info(f"Starting backtest from {from_date} to {to_date}...")
-
-    for i in range(1, len(daily_df)):
-        current_date = daily_df.iloc[i]['date']
-        day_tf_df = df_tf[df_tf['date_only'] == current_date].copy()
-        if day_tf_df.empty or len(day_tf_df) < 50: continue # Need enough data for indicators
-
-        cpr_pivots = calculate_cpr(daily_df.iloc[i-1:i])
-        day_sentiment = "Bullish" if daily_df.iloc[i-1]['close'] > cpr_pivots.get('pivot', 0) else "Bearish"
-        
-        # Calculate indicators for the whole day at once
-        day_tf_df['rsi'] = calculate_rsi(day_tf_df['close'])
-        if signals_config['use_ema_20_crossover']: day_tf_df['ema_20'] = calculate_ema(day_tf_df['close'], 20)
-        if signals_config['use_ema_50_crossover']: day_tf_df['ema_50'] = calculate_ema(day_tf_df['close'], 50)
-        
-        position = None
-        for j in range(30, len(day_tf_df)): # Start after enough data for divergence calc
-            if position: # Simplified exit for backtesting
-                if position == 'BUY' and day_tf_df.iloc[j]['close'] < cpr_pivots['pivot']:
-                    trades.append({'entry': entry_price, 'exit': day_tf_df.iloc[j]['close'], 'type': 'BUY'})
-                    position = None
-                elif position == 'SELL' and day_tf_df.iloc[j]['close'] > cpr_pivots['pivot']:
-                    trades.append({'entry': entry_price, 'exit': day_tf_df.iloc[j]['close'], 'type': 'SELL'})
-                    position = None
-            
-            if not position:
-                hist_slice = day_tf_df.iloc[:j+1]
-                current_candle = day_tf_df.iloc[j]; last_candle = day_tf_df.iloc[j-1]
-                
-                signal_votes = []
-                if signals_config['use_rsi_divergence']: signal_votes.append(check_rsi_divergence(hist_slice, hist_slice['rsi']))
-                if signals_config['use_cpr_breakout']: signal_votes.append(check_cpr_breakout(current_candle, cpr_pivots, last_candle))
-                if signals_config['use_ema_20_crossover']: signal_votes.append(check_ema_crossover(hist_slice, current_candle, last_candle, 20))
-                if signals_config['use_ema_50_crossover']: signal_votes.append(check_ema_crossover(hist_slice, current_candle, last_candle, 50))
-                
-                if day_sentiment == "Bullish" and all(s == 'Bullish' for s in signal_votes if s != 'None'):
-                    position = 'BUY'; entry_price = current_candle['close']
-                elif day_sentiment == "Bearish" and all(s == 'Bearish' for s in signal_votes if s != 'None'):
-                    position = 'SELL'; entry_price = current_candle['close']
     
-    # --- Analyze Results ---
-    wins = sum(1 for t in trades if (t['type'] == 'BUY' and t['exit'] > t['entry']) or (t['type'] == 'SELL' and t['exit'] < t['entry']))
-    logging.info("\n--- BACKTEST RESULTS ---")
-    logging.info(f"Total Signals Generated: {len(trades)}")
-    logging.info(f"Winning Signals: {wins}")
-    logging.info(f"Win Probability: {(wins / len(trades) * 100) if trades else 0:.2f}%")
-    logging.info("------------------------\n")
-
-if __name__ == "__main__":
-    config = load_config()
-    kite = KiteConnect(api_key=config['zerodha']['api_key'])
-    if not config['zerodha'].get('access_token'):
-        print("Access token not found. Please run trading_bot.py first.")
+    historical_dates_to_test = []
+    if target_conditions:
+        condition_identifier = MarketConditionIdentifier()
+        logging.info("Filtering historical dates based on target conditions...")
+        for date_obj in all_data_day['date'].unique():
+            hist_conditions = condition_identifier.get_conditions_for_date(date_obj, vix_data, all_data_day)
+            if target_conditions.issubset(hist_conditions):
+                historical_dates_to_test.append(date_obj)
+        logging.info(f"Found {len(historical_dates_to_test)} matching historical days for conditional backtest.")
     else:
-        kite.set_access_token(config['zerodha']['access_token'])
-        from_date = datetime.date(2023, 12, 1); to_date = datetime.date(2023, 12, 31)
-        run_backtest(kite, config, from_date, to_date)
+        historical_dates_to_test = all_data_day['date'].unique().tolist()
+
+    if not historical_dates_to_test:
+        logging.warning("No matching historical days found for conditional backtest."); return 0.0
+
+    for i in range(1, len(all_data_day)):
+        current_date = all_data_day.iloc[i]['date']
+        if current_date not in historical_dates_to_test: continue
+
+        day_tf_df = all_data_tf[all_data_tf['date_only'] == current_date].copy()
+        if len(day_tf_df) < 50: continue
+
+        # Set DatetimeIndex to prevent VWAP error
+        day_tf_df['date'] = pd.to_datetime(day_tf_df['date'])
+        day_tf_df = day_tf_df.set_index('date').sort_index()
+
+        from indicators import calculate_cpr
+        cpr_pivots = calculate_cpr(all_data_day.iloc[i-1:i])
+        if not cpr_pivots: continue
+        cpr_pivots['prev_high'] = all_data_day.iloc[i-1]['high'].item()
+        cpr_pivots['prev_low'] = all_data_day.iloc[i-1]['low'].item()
+        
+        # Pre-calculate all indicators for the day
+        day_tf_df.ta.vwap(append=True)
+        day_tf_df['rsi'] = ta.rsi(day_tf_df['close'])
+        day_tf_df['ema_20'] = ta.ema(day_tf_df['close'], length=20)
+        day_tf_df['ema_50'] = ta.ema(day_tf_df['close'], length=50)
+        supertrend = ta.supertrend(day_tf_df['high'], day_tf_df['low'], day_tf_df['close'], length=10, multiplier=3)
+        if supertrend is not None and not supertrend.empty: day_tf_df['supertrend_direction'] = supertrend.get('SUPERTd_10_3.0', 0)
+        macd = ta.macd(day_tf_df['close'], fast=12, slow=26, signal=9)
+        if macd is not None and not macd.empty:
+            day_tf_df['macd'] = macd.get('MACD_12_26_9', 0)
+            day_tf_df['macd_signal'] = macd.get('MACDs_12_26_9', 0)
+        day_tf_df['atr'] = ta.atr(day_tf_df['high'], day_tf_df['low'], day_tf_df['close'], length=14)
+        day_tf_df['atr_ma'] = day_tf_df['atr'].rolling(window=20).mean()
+        day_tf_df['spread'] = day_tf_df['high'] - day_tf_df['low']
+        day_tf_df['volume_ma'] = day_tf_df['volume'].rolling(window=20).mean()
+        
+        sentiment = "Bullish"
+        position = None
+        for j in range(20, len(day_tf_df)):
+            if not position:
+                signal = strategy.generate_signals(day_tf_df, j, sentiment, cpr_pivots=cpr_pivots)
+                if signal != 'HOLD':
+                    position, entry_price = signal, day_tf_df.iloc[j]['close']
+            else:
+                if (position == 'BUY' and day_tf_df.iloc[j]['low'] < entry_price * 0.98) or \
+                   (position == 'SELL' and day_tf_df.iloc[j]['high'] > entry_price * 1.02):
+                    trades.append({'entry': entry_price, 'exit': day_tf_df.iloc[j]['close'], 'type': position})
+                    position = None
+    
+    if not trades:
+        logging.warning(f"No trades were executed during {mode} backtest for {strategy_name}."); return 0.0
+
+    wins = sum(1 for t in trades if (t['type'] == 'BUY' and t['exit'] > t['entry']) or (t['type'] == 'SELL' and t['exit'] < t['entry']))
+    win_rate = (wins / len(trades)) * 100
+    logging.info(f"--- {mode} Backtest Results for {strategy_name}: ---")
+    logging.info(f"Total Trades: {len(trades)}, Wins: {wins}, Win Rate: {win_rate:.2f}%")
+    return win_rate
