@@ -5,6 +5,7 @@ from strategy_factory import get_strategy
 from market_context import MarketConditionIdentifier
 import time
 import pandas_ta as ta
+import os # Import os
 
 def fetch_historical_data_in_chunks(kite, token, from_date, to_date, timeframe):
     """
@@ -132,4 +133,25 @@ def run_backtest(kite, config, strategy_name, from_date, to_date, target_conditi
     win_rate = (wins / len(trades)) * 100
     logging.info(f"--- {mode} Backtest Results for {strategy_name}: ---")
     logging.info(f"Total Trades: {len(trades)}, Wins: {wins}, Win Rate: {win_rate:.2f}%")
+
+    # --- NEW: Save backtest results to CSV ---
+    result_data = {
+        'timestamp': [datetime.datetime.now()],
+        'strategy': [strategy_name],
+        'mode': [mode],
+        'conditions': [str(target_conditions) if target_conditions else 'N/A'],
+        'from_date': [from_date],
+        'to_date': [to_date],
+        'total_trades': [len(trades)],
+        'win_rate_pct': [win_rate]
+    }
+    result_df = pd.DataFrame(result_data)
+    log_path = 'output/backtest_results.csv'
+    if not os.path.exists(log_path):
+        result_df.to_csv(log_path, index=False)
+    else:
+        result_df.to_csv(log_path, mode='a', header=False, index=False)
+    logging.info(f"Backtest results for {strategy_name} saved to {log_path}")
+    # --- END NEW ---
+    
     return win_rate

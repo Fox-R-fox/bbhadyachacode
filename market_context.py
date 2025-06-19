@@ -4,11 +4,13 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import numpy as np
+import time
+from kiteconnect.exceptions import DataException, NetworkException
 
 class EconomicCalendar:
     """
     Dynamically scrapes and provides dates for major market-moving events.
-    It fetches data from the official Federal Reserve and RBI (via reliable news sources) websites.
+    It fetches data from the official Federal Reserve and uses a reliable fallback for RBI.
     """
     def __init__(self):
         self.events = self._load_events()
@@ -18,62 +20,55 @@ class EconomicCalendar:
         fed_dates = {}
         try:
             url = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            response = requests.get(url, headers=headers)
+            headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36'}
+            response = requests.get(url, headers=headers, timeout=15)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.content, 'html.parser')
-            # The dates are within panels with class 'panel-default'
-            panels = soup.find_all('div', class_='panel-default')
-            current_year = datetime.date.today().year
+            panels = soup.find_all('div', class_='fomc-meeting')
             
             for panel in panels:
-                year_tag = panel.find('h4', class_='panel-title')
-                if year_tag and str(current_year) in year_tag.text or str(current_year + 1) in year_tag.text:
-                    rows = panel.find_all('div', class_='fomc-meeting__month')
-                    for row in rows:
-                        month_tag = row.find('div', class_='fomc-meeting__month-name')
-                        date_tags = row.find_all('div', class_='fomc-meeting__date')
-                        if month_tag and date_tags:
+                year_tag = panel.find('h4')
+                if not year_tag or not year_tag.text: continue
+                
+                # Extract year safely
+                year_str_list = [s for s in year_tag.text.split() if s.isdigit()]
+                if not year_str_list: continue
+                year = year_str_list[0]
+
+                meeting_entries = panel.find_all('div', class_='fomc-meeting__month')
+                for entry in meeting_entries:
+                    month_tag = entry.find('div', class_='fomc-meeting__month-name')
+                    date_tags = entry.find_all('div', class_='fomc-meeting__date')
+                    if month_tag and date_tags:
+                        try:
                             month = month_tag.text.strip()
-                            # Meetings can be 1 or 2 days
-                            day = date_tags[-1].text.strip().split('-')[-1] # Take the last day of the meeting
-                            # Construct date string and parse it
-                            date_str = f"{day} {month} {year_tag.text.strip()[-4:]}"
+                            day = date_tags[-1].text.strip().split('-')[-1]
+                            date_str = f"{day} {month} {year}"
                             event_date = datetime.datetime.strptime(date_str, "%d %B %Y").date()
                             fed_dates[event_date.strftime('%Y-%m-%d')] = "EVENT_FED_MEETING"
-            logging.info(f"Successfully scraped {len(fed_dates)} FED meeting dates.")
+                        except (ValueError, IndexError):
+                            continue # Skip if date parsing fails for an entry
+            if fed_dates:
+                logging.info(f"Successfully scraped {len(fed_dates)} FED meeting dates.")
+            else:
+                logging.warning("Scraping FED dates returned no results. Check website structure.")
         except Exception as e:
             logging.error(f"Could not scrape FED dates: {e}. Using fallback.")
+            # Add a fallback for the current year in case of scraping failure
+            fed_dates["2025-06-18"] = "EVENT_FED_MEETING"
+            fed_dates["2025-07-30"] = "EVENT_FED_MEETING"
         return fed_dates
 
     def _scrape_rbi_dates(self):
-        """Scrapes RBI MPC meeting dates from a reliable news source."""
-        rbi_dates = {}
-        try:
-            # Note: Scraping news sites can be unreliable. This is an example.
-            url = "https://www.livemint.com/topic/rbi-mpc-meeting"
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-
-            soup = BeautifulSoup(response.content, 'html.parser')
-            # This requires finding a reliable pattern on the page. Let's assume a simple list for this example.
-            # A more robust solution would be needed for production.
-            # Example search for list items containing "MPC meeting dates"
-            # This is a placeholder for a more complex scraping logic.
-            # For this example, we will fall back to a static list if scraping fails.
-            raise NotImplementedError("Web scraping logic for RBI dates needs to be specific and is fragile.")
-
-        except Exception as e:
-            logging.warning(f"Could not scrape RBI dates, using fallback list: {e}")
-            # Fallback to a static list if scraping fails
-            rbi_dates = {
-                "2025-04-09": "EVENT_RBI_POLICY", "2025-06-06": "EVENT_RBI_POLICY",
-                "2025-08-07": "EVENT_RBI_POLICY", "2025-10-01": "EVENT_RBI_POLICY",
-                "2025-12-05": "EVENT_RBI_POLICY", "2026-02-06": "EVENT_RBI_POLICY",
-            }
-        logging.info(f"Loaded {len(rbi_dates)} RBI policy dates.")
+        """Uses a static list for RBI dates as scraping is unreliable."""
+        logging.warning("RBI date scraping is fragile; using a reliable hardcoded fallback list.")
+        rbi_dates = {
+            "2025-04-09": "EVENT_RBI_POLICY", "2025-06-06": "EVENT_RBI_POLICY",
+            "2025-08-07": "EVENT_RBI_POLICY", "2025-10-01": "EVENT_RBI_POLICY",
+            "2025-12-05": "EVENT_RBI_POLICY", "2026-02-06": "EVENT_RBI_POLICY",
+        }
+        logging.info(f"Loaded {len(rbi_dates)} RBI policy dates from static list.")
         return rbi_dates
 
     def _load_events(self):
@@ -98,11 +93,19 @@ class MarketConditionIdentifier:
         self.nifty_token = self._get_instrument_token('NIFTY 50', 'NSE')
 
     def _get_instrument_token(self, name, exchange):
-        return [i['instrument_token'] for i in self.kite.instruments(exchange) if i['tradingsymbol'] == name][0]
+        """Helper to find instrument token with a retry mechanism."""
+        for i in range(3): # Retry up to 3 times
+            try:
+                instruments = self.kite.instruments(exchange)
+                return [i['instrument_token'] for i in instruments if i['tradingsymbol'] == name][0]
+            except (DataException, NetworkException) as e:
+                logging.warning(f"Attempt {i+1}/3: Failed to fetch instruments for {exchange}. Retrying... Error: {e}")
+                time.sleep(2 * (i + 1)) # Wait for 2, 4, 6 seconds
+        raise ConnectionError(f"Could not fetch instruments for {exchange} after multiple retries.")
 
     def get_conditions_for_date(self, target_date):
         """Fetches all relevant data for a target date and returns a set of condition tags."""
-        from_date = target_date - datetime.timedelta(days=60) # Longer lookback for IV
+        from_date = target_date - datetime.timedelta(days=60)
         to_date = target_date
         conditions = set()
 
@@ -132,7 +135,7 @@ class MarketConditionIdentifier:
                 else: conditions.add('IV_LOW')
 
             return conditions if conditions else {'NORMAL'}
-
         except Exception as e:
             logging.warning(f"Could not determine full conditions for {target_date}: {e}")
             return {'UNKNOWN'}
+

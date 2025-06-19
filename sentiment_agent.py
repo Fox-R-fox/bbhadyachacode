@@ -4,11 +4,12 @@ import json
 import os
 from newsapi import NewsApiClient
 from textblob import TextBlob
+import time
 
 class SentimentAgent:
     """
-    An agent responsible for fetching news and determining market sentiment.
-    It now includes a local caching mechanism to avoid re-fetching news.
+    An agent for fetching news and determining market sentiment with intensity.
+    Includes a local caching mechanism to avoid redundant API calls.
     """
     def __init__(self, config):
         self.config = config
@@ -18,86 +19,89 @@ class SentimentAgent:
         self.top_constituents = [
             "Reliance Industries", "HDFC Bank", "ICICI Bank", "Infosys",
             "Larsen & Toubro", "TCS", "Bharti Airtel", "ITC", "Kotak Mahindra Bank",
-            "Hindustan Unilever", "RBI", "NIFTY", "Attack"
+            "Hindustan Unilever", "RBI", "NIFTY", "Attack", "FED", "Repo Rate", "Indian economy", "India"
         ]
 
     def _get_news_articles(self):
         """
-        Fetches news from cache if available, otherwise from the API.
+        Fetches news from the last 2 days. It serves from a time-sensitive
+        cache to allow for periodic refreshes of news within the same day.
         """
-        today_str = datetime.date.today().isoformat()
-        cache_file_path = os.path.join(self.cache_dir, f"news_{today_str}.json")
+        today = datetime.date.today()
+        from_date = today - datetime.timedelta(days=2)
+        cache_file_path = os.path.join(self.cache_dir, f"news_{today.isoformat()}.json")
+        CACHE_EXPIRATION_SECONDS = 3600  # 1 hour
 
-        # Check if cached news for today exists
-        if os.path.exists(cache_file_path):
-            logging.info(f"SentimentAgent: Loading today's news from cache: {cache_file_path}")
+        # Check if a recent cache file exists and is valid
+        if os.path.exists(cache_file_path) and (time.time() - os.path.getmtime(cache_file_path)) < CACHE_EXPIRATION_SECONDS:
+            logging.info(f"SentimentAgent: Loading recent news from cache (less than {int(CACHE_EXPIRATION_SECONDS / 60)} minutes old).")
             with open(cache_file_path, 'r') as f:
                 return json.load(f)
-        
-        # If no cache, fetch from API
-        logging.info("SentimentAgent: No cache found. Fetching fresh news from API...")
+
+        logging.info("SentimentAgent: Fetching fresh news from API for the last 2 days...")
         try:
-            query = f"{self.config['trading_flags']['underlying_instrument']} OR " + " OR ".join(self.top_constituents)
-            from_date = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
-            
+            query = f"({self.config['trading_flags']['underlying_instrument']}) OR " + " OR ".join(f'"{c}"' for c in self.top_constituents)
             top_headlines = self.newsapi.get_everything(
                 q=query,
                 language='en',
-                sort_by='relevancy',
-                page_size=100, # Fetch a few more to allow for filtering
-                from_param=from_date
+                sort_by='publishedAt',  # Sort by newest first to prioritize recent news
+                page_size=100,
+                from_param=from_date.isoformat(),
+                to=today.isoformat()
             )
-
-            # Save the fresh news to cache for future runs today
             with open(cache_file_path, 'w') as f:
                 json.dump(top_headlines, f)
-            logging.info(f"SentimentAgent: Saved fresh news to cache: {cache_file_path}")
-            
             return top_headlines
-
         except Exception as e:
             logging.error(f"SentimentAgent: Could not fetch news from API: {e}")
             return None
 
-
     def get_market_sentiment(self):
         """
-        Calculates average sentiment from news and returns the market bias.
+        Calculates sentiment using a weighted average based on news recency
+        and returns bias with intensity.
         """
-        logging.info("SentimentAgent: Determining market sentiment...")
-        
-        top_headlines = self._get_news_articles()
-
+        top_headlines = self._get_news_articles() #
         if not top_headlines or not top_headlines.get('articles'):
-            logging.warning("SentimentAgent: No news articles found. Defaulting to Neutral.")
-            return "Neutral"
+            logging.warning("SentimentAgent: No news articles found.")
+            return "Neutral" #
 
         sentiment_scores = []
-        logging.info("SentimentAgent: Analyzing top headlines...")
         for article in top_headlines['articles']:
-            title = article.get('title', '')
-            description = article.get('description', '')
-            
-            # Skip articles that are just "[Removed]"
-            if not title or title == "[Removed]":
-                continue
-
-            content = f"{title}. {description}"
-            analysis = TextBlob(content)
-            sentiment_scores.append(analysis.sentiment.polarity)
-            logging.info(f"  - Headline: '{title[:60]}...' | Polarity: {analysis.sentiment.polarity:.2f}")
+            if (title := article.get('title', '')) and title != "[Removed]":
+                content = f"{title}. {article.get('description', '')}"
+                sentiment_scores.append(TextBlob(content).sentiment.polarity) #
 
         if not sentiment_scores:
-            logging.warning("SentimentAgent: No valid headlines to analyze. Defaulting to Neutral.")
-            return "Neutral"
+            logging.warning("SentimentAgent: No valid headlines to analyze.")
+            return "Neutral" #
 
-        average_sentiment = sum(sentiment_scores) / len(sentiment_scores)
-        logging.info(f"SentimentAgent: Average sentiment score is {average_sentiment:.3f}")
+        # --- Weighted Average Calculation ---
+        # Articles are sorted newest to oldest from the API call.
+        weighted_sum = 0
+        total_weight = 0
+        n = len(sentiment_scores)
 
-        if average_sentiment > 0.05:
-            return "Bullish"
-        elif average_sentiment < -0.05:
-            return "Bearish"
+        for i, score in enumerate(sentiment_scores):
+            # Weight decays linearly from n for the newest to 1 for the oldest.
+            weight = n - i
+            weighted_sum += score * weight
+            total_weight += weight
+
+        if total_weight == 0:
+            avg_sentiment = 0.0
         else:
-            return "Neutral"
+            avg_sentiment = weighted_sum / total_weight
 
+        logging.info(f"SentimentAgent: Weighted average sentiment score is {avg_sentiment:.3f}")
+
+        if avg_sentiment > 0.4:
+            return "Very Bullish" #
+        elif avg_sentiment > 0.05:
+            return "Bullish" #
+        elif avg_sentiment < -0.4:
+            return "Very Bearish" #
+        elif avg_sentiment < -0.05:
+            return "Bearish" #
+        else:
+            return "Neutral" #

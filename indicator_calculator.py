@@ -6,6 +6,10 @@ def calculate_all_indicators(df: pd.DataFrame, config: dict):
     Calculates and attaches all required technical indicators to the dataframe.
     This is called once per day to avoid redundant calculations.
     """
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.set_index('date').sort_index()
+
     # Gemini Default & RSI Divergence Strategy Indicators
     df['rsi'] = ta.rsi(df['close'], length=14)
     df['ema_9'] = ta.ema(df['close'], length=9)
@@ -31,6 +35,7 @@ def calculate_all_indicators(df: pd.DataFrame, config: dict):
     df['volume_ma'] = df['volume'].rolling(window=20).mean()
 
     # Momentum VWAP & ORB Strategy Indicators
+    # This calculation will now work correctly
     df['vwap'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
 
     # Bollinger Band Squeeze Strategy Indicators
