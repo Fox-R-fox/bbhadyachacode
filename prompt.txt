@@ -1,0 +1,17 @@
+Here is the new project for you.
+1. I want to develop the trading bot using python and flask. This application will have a well designed UI to performed the desired tasks
+2. I want to you develop this app in which we will have 2 options like paper trading or Live trading.   If market is closed then we will do only paper trading and if market is open then live trading will be done.
+3. The stock or indices will be fetched from zerodha api based on the user captial in the paper wallet or zerodha wallet.
+4. Once the stocks are fetched then the bot will perform the trading automatically using moving average stratagies or other best stratagies for scalping. Use the best available market strategies.
+5. Based on the market and the stock performance bot will keep on buying and selling the stocks and make sure it does not go in red. alway profit.
+6. User should be able to set the zerodha api secrets, access key and api token in setting page and should be able to check the connectivity on button click.
+7. Every action done by bot or by user should have a message feedback.
+8. While executing the bot user should be able to selete the trade type like live or paper, stock qty, capital to use, strategies, and other best options and also stop loss and target in percentage etc...
+9. Once the bot is executed it will perform its task
+10. user will have a seperate pages for live market which will show the stocks identified and its current price and other releveant headers. Also user should be able to see orders and positions in seperate pages as well as logs.
+11. Also create a Dashboard page to see the wallet amount from paper wallet and zerodha wallet based on the trade type selected, profit and loss, trades, captical used and so on and so forth. make it best. also user can start the bot from dashboard page etc.......
+12. Make sure not to hard code any stocks. use Zerodha api to get the stock details eithter for simulation in paper trade and live trade.
+
+So now code every single bit of file in detailed format and code and give me the folder structre file name and code where to place. make sure it should work out of the box and also create the README file for requirements installation and runninf the bot. Create best UI and strategies. make it best.
+
+Start coading. Also I am uploading some strategies files. check if they are good to be used here. also this app should work on any ip address. 0.0.0.0
