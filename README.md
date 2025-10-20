@@ -155,3 +155,23 @@ The bot will then start its setup sequence and begin trading.
 
 Disclaimer
 This software is provided for educational and experimental purposes only. Algorithmic trading involves substantial risk and is not suitable for all investors. The authors and contributors are not responsible for any financial losses incurred through the use of this software. Always test thoroughly in paper trading mode before deploying with real capital.
+
+---
+
+## Quickstart
+
+1. Create venv (Python 3.10–3.12):
+   ```bash
+   python -m venv .venv
+   # Windows
+   .\.venv\Scripts\activate
+   # macOS/Linux
+   source .venv/bin/activate
+   ```
+2. Install prerequisites for TA-Lib:
+   - Windows: download wheel from Gohlke or prebuilt TA-Lib; then `pip install <wheel>`
+   - macOS: `brew install ta-lib`
+   - Ubuntu/Debian: `sudo apt-get update && sudo apt-get install -y build-essential libffi-dev ta-lib`
+3. Install deps: `pip install -r requirements.txt`
+4. Edit `config.yaml` and set your keys (placeholders included).
+5. Run: `python trading_bot.py`
